@@ -25,6 +25,7 @@ EXPORT_DIR.mkdir(exist_ok=True)
 ALLOWED_EXTENSIONS = {"pdf"}
 
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "1500"))
+DEFAULT_MAX_PAGES = int(os.environ.get("DEFAULT_MAX_PAGES", "3"))
 FUZZY_MATCH_THRESHOLD = int(os.environ.get("FUZZY_MATCH_THRESHOLD", "92"))
 PDF_RENDER_SCALE = float(os.environ.get("PDF_RENDER_SCALE", "1.8"))
 BACKGROUND_WORKERS = int(os.environ.get("BACKGROUND_WORKERS", "3"))
@@ -125,44 +126,73 @@ def load_business_database() -> Tuple[Dict[str, str], Dict[str, str], List[str],
 BUSINESS_LOOKUP, DISPLAY_NAMES, BUSINESS_KEYS, PREFIX_INDEX = load_business_database()
 
 
-def build_page_array(total_pages: int, max_pages: int = 3) -> List[int]:
+def build_page_array(total_pages: int, max_pages: int = DEFAULT_MAX_PAGES) -> List[int]:
     """
-    Skip page 1 entirely.
+    Fast and accurate page scan order.
 
-    pdf[0] = page 1 (ignored)
-    pdf[1] = page 2
-    pdf[2] = page 3
-    pdf[3] = page 4
+    PDF pages are zero-indexed:
+      pdf[0] = page 1
+      pdf[1] = page 2
+      pdf[2] = page 3
+      pdf[3] = page 4
 
-    Default scan = 3 pages (2, 3, 4).
+    Strategy:
+      1. Skip page 1 first because many RJSC files use it as a blank/cover scan.
+      2. Scan page 2, page 3, page 4.
+      3. If more pages are allowed, scan the last 3 pages as fallback.
+      4. Do not duplicate pages.
+
+    For speed, DEFAULT_MAX_PAGES should usually be 3.
+    For better accuracy, set DEFAULT_MAX_PAGES to 6.
     """
-    page_array = []
-    start_page = 1
+    order = []
 
-    for page_index in range(start_page, start_page + max_pages):
-        if page_index < total_pages:
-            page_array.append(page_index)
+    def add(page_index: int) -> None:
+        if 0 <= page_index < total_pages and page_index not in order:
+            order.append(page_index)
 
-    return page_array
+    for page_index in [1, 2, 3]:
+        add(page_index)
+
+    for page_index in range(max(0, total_pages - 3), total_pages):
+        add(page_index)
+
+    if max_pages is not None:
+        return order[:max_pages]
+
+    return order
+
 
 def get_pdf_page_text(page) -> Tuple[str, str]:
     """
     Parse first, OCR second.
-    This is faster because searchable PDFs do not need OCR.
+
+    Most old RJSC files are scanned images, so parsed text may be empty.
+    When OCR is needed, this renders the page and runs Tesseract.
     """
     try:
         textpage = page.get_textpage()
         text = textpage.get_text_bounded()
         textpage.close()
+
         if text and len(text.strip()) > 40:
             return text, "parsed_text"
     except Exception:
         pass
+
     try:
         image = page.render(scale=PDF_RENDER_SCALE).to_pil()
+
         config = "--oem 3 --psm 6"
         text = pytesseract.image_to_string(image, config=config)
-        return text or "", "ocr"
+
+        if not text or len(text.strip()) < 20:
+            fallback_config = "--oem 3 --psm 11"
+            text = pytesseract.image_to_string(image, config=fallback_config)
+            return text or "", "ocr_psm11"
+
+        return text or "", "ocr_psm6"
+
     except Exception as e:
         return "", f"ocr_failed: {e}"
 
@@ -181,11 +211,12 @@ def line_candidates(text: str) -> List[str]:
         if re.search(rf"\b{suffix_regex}\b", upper):
             candidates.add(upper)
     patterns = [
-        r"THE\s+NAME\s+OF\s+THE\s+COMPANY\s+IS\s+(.{5,120}?)(?:\n|$)",
-        r"IN\s+THE\s+MATTER\s+OF\s+(.{5,120}?)(?:\n|$)",
-        r"MATTER\s+OF\s+(.{5,120}?)(?:\n|$)",
-        r"RE:\s+(.{5,120}?)(?:\n|$)",
-        r"CALLED\s+(.{5,120}?)(?:\n|$)",
+        r"THE\s+NAME\s+OF\s+THE\s+COMPANY\s+IS\s+(.{5,160}?)(?:\n|$)",
+        r"IN\s+THE\s+MATTER\s+OF\s+(.{5,160}?)(?:\n|$)",
+        r"MATTER\s+OF\s+(.{5,160}?)(?:\n|$)",
+        r"RE:\s+(.{5,160}?)(?:\n|$)",
+        r"CALLED\s+(.{5,160}?)(?:\n|$)",
+        r"\b([A-Z][A-Z0-9&.'\- ]{3,90}?\s+(?:LIMITED|LTD\.?|INC\.?|INCORPORATED|CORPORATION|CORP\.?|COMPANY))\b",
     ]
     for pat in patterns:
         for m in re.finditer(pat, joined, flags=re.IGNORECASE | re.DOTALL):
@@ -301,9 +332,9 @@ def process_pdf(pdf_path: Path, original_filename: str, max_pages: Optional[int]
         return result
     try:
         total_pages = len(pdf)
-        page_array = build_page_array(total_pages, 3)
+        page_array = build_page_array(total_pages, max_pages or DEFAULT_MAX_PAGES)
         if not page_array:
-            result.update(status="error", notes="PDF does not have page 2 or page 3 to scan.")
+            result.update(status="error", notes="PDF does not have enough pages to scan after skipping page 1.")
             return result
         for scan_number, page_index in enumerate(page_array, start=1):
             update_job(
@@ -350,10 +381,10 @@ def process_pdf(pdf_path: Path, original_filename: str, max_pages: Optional[int]
                 match_type="candidate_only",
                 text_method=best_method,
                 status="completed",
-                notes="Business name candidate found on page 2 or page 3, but no registry number matched in SQLite database.",
+                notes="Business name candidate found in selected pages, but no registry number matched in SQLite database.",
             )
         else:
-            result.update(status="completed", notes="No business-name candidate found on page 2 or page 3.")
+            result.update(status="completed", notes="No business-name candidate found in selected pages.")
     except Exception as e:
         result.update(status="error", notes=str(e))
     finally:
@@ -493,7 +524,8 @@ def health():
         "recommended_local_workers": "2-4",
         "pdf_render_scale": PDF_RENDER_SCALE,
         "scan_mode": "parse_text_first_then_ocr_page_2_and_page_3_only",
-        "pages_scanned": "pdf[1], pdf[2]",
+        "pages_scanned": "starts at pdf[1] / page 2, then fallback pages if enabled",
+        "default_max_pages": DEFAULT_MAX_PAGES,
     })
 
 
@@ -504,6 +536,16 @@ def process_uploads():
     files = request.files.getlist("pdfs")
     if not files:
         return jsonify({"error": "No files selected."}), 400
+
+    try:
+        max_pages_value = request.form.get("max_pages", str(DEFAULT_MAX_PAGES)).strip()
+        if max_pages_value.lower() in {"all", "none", ""}:
+            max_pages = None
+        else:
+            max_pages = max(1, int(max_pages_value))
+    except ValueError:
+        max_pages = DEFAULT_MAX_PAGES
+
     job_id = uuid.uuid4().hex[:12]
     job_upload_dir = UPLOAD_DIR / job_id
     job_upload_dir.mkdir(parents=True, exist_ok=True)
@@ -537,7 +579,7 @@ def process_uploads():
             "match_score": "",
             "text_method": "",
             "status": "queued",
-            "notes": "Queued for fast page 2/page 3 parsing scan.",
+            "notes": "Queued for fast scan starting at page 2.",
         })
     with JOB_LOCK:
         JOBS[job_id] = {
@@ -553,7 +595,7 @@ def process_uploads():
             "download_csv_url": None,
         }
     if files_to_process:
-        threading.Thread(target=process_job, args=(job_id, files_to_process, None), daemon=True).start()
+        threading.Thread(target=process_job, args=(job_id, files_to_process, max_pages), daemon=True).start()
     else:
         update_job(job_id, status="error", message="No valid PDF files were uploaded.")
     return jsonify({
