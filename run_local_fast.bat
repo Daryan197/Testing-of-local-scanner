@@ -1,0 +1,8 @@
+@echo off
+set BACKGROUND_WORKERS=3
+set DEFAULT_MAX_PAGES=3
+set PDF_RENDER_SCALE=1.6
+set FUZZY_MATCH_THRESHOLD=92
+set MAX_UPLOAD_MB=1500
+python app.py
+pause
